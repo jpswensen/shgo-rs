@@ -1,0 +1,15 @@
+[package]
+name = "shgo-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pyo3 = { version = "0.25.1", features = ["auto-initialize"] }
+numpy = "0.25.0"
+rand = "0.9.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+panic = "abort"
+codegen-units = 1
