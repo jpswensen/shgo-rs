@@ -11,7 +11,7 @@ use pyo3::types::{PyAny, PyDict, PyList, IntoPyDict};
 
 
 #[derive(Debug, Clone)]
-struct OptimizeResultRust {
+struct OptimizeResult {
     // Primary solution
     x: Vec<f64>,
     fun: Option<f64>,
@@ -32,7 +32,7 @@ struct OptimizeResultRust {
     nlhev: Option<i64>,
 }
 
-impl OptimizeResultRust {
+impl OptimizeResult {
     fn write_pretty(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Helpers
         fn fmt_f(v: f64) -> String { format!("{:.6e}", v) }
@@ -107,7 +107,7 @@ impl OptimizeResultRust {
     }
 }
 
-impl fmt::Display for OptimizeResultRust {
+impl fmt::Display for OptimizeResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.write_pretty(f)
     }
@@ -126,7 +126,7 @@ where
 fn extract_optimize_result<'py>(
     _py: Python<'py>,
     result: Bound<'py, PyAny>,
-    ) -> PyResult<OptimizeResultRust> {
+    ) -> PyResult<OptimizeResult> {
     // Small helpers to extract numpy arrays if present
     fn try_get_array1<'py>(obj: &Bound<'py, PyAny>, name: &str) -> Option<Vec<f64>> {
         match obj.getattr(name) {
@@ -175,7 +175,7 @@ fn extract_optimize_result<'py>(
     let nljev: Option<i64> = try_get_attr(&result, "nljev");
     let nlhev: Option<i64> = try_get_attr(&result, "nlhev");
 
-    Ok(OptimizeResultRust {
+    Ok(OptimizeResult {
         x: x_vec,
         fun,
         success,
@@ -329,7 +329,7 @@ impl ShgoOptions {
 }
 
 
-// Variant that returns the full OptimizeResultRust for richer information
+// Variant that returns the full OptimizeResult for richer information
 fn shgo<F, C>(
     objective: F,
     bounds: &[(f64, f64)],
@@ -340,7 +340,7 @@ fn shgo<F, C>(
     options: Option<ShgoOptions>,
     sampling_method: Option<&str>,
     workers: Option<usize>,
-) -> OptimizeResultRust
+) -> OptimizeResult
 where
     F: Fn(&[f64]) -> f64 + Send + Sync + 'static,
     C: Fn(&[f64]) + Send + Sync + 'static,
