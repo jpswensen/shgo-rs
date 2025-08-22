@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::collections::HashMap;
 
-use numpy::{PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyArray1, PyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, IntoPyDict};
 
@@ -231,24 +231,6 @@ fn rastrigin_fake_long(x: &[f64], a:f64) -> f64 {
     rv + dummy * 1E-20
 }
 
-// #[pyclass]
-// struct Objective {
-//     func: Arc<dyn Fn(&[f64]) -> f64 + Send + Sync>,
-// }
-
-// #[pymethods]
-// impl Objective {
-//     fn __call__(&self, py: Python, x: numpy::PyReadonlyArray1<f64>) -> PyResult<f64> {
-//         // Borrow while holding GIL, then COPY to an owned Vec so it's valid without the GIL
-//         let v: Vec<f64> = x.as_slice()?.to_vec();
-
-//         // Run the Rust closure outside the GIL so threads can execute truly in parallel
-//         // NOTE: This doesn't give much benefit unless the objective function is fairly expensive
-//         let val = py.allow_threads(|| (self.func)(&v));
-//         Ok(val)
-//     }
-// }
-
 #[pyclass] // must be Sync in free-threaded builds
 pub struct Objective {
     func: Arc<dyn Fn(&[f64]) -> f64 + Send + Sync + 'static>,
@@ -265,6 +247,174 @@ impl Objective {
         let f = self.func.clone();
         let val = py.allow_threads(|| (f)(&v));
         Ok(val)
+    }
+}
+
+#[pyclass]
+struct ConstraintFunction {
+    func: Arc<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync + 'static>,
+}
+
+#[pymethods]
+impl ConstraintFunction {
+    fn __call__(&self, py: Python<'_>, x: PyReadonlyArray1<'_, f64>) -> PyResult<Py<PyAny>> {
+        let v: Vec<f64> = x.as_slice()?.to_vec();
+        let f = self.func.clone();
+        let out: Vec<f64> = py.allow_threads(|| (f)(&v));
+        // Return as a NumPy array via the numpy crate (avoids PyList Result issues)
+    let arr = PyArray1::<f64>::from_vec(py, out);
+    // Convert Bound<PyArray> -> Bound<PyAny> -> Py<PyAny>
+    Ok(arr.into_any().unbind())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ConstraintType { Eq, Ineq }
+
+impl ConstraintType {
+    fn as_str(&self) -> &'static str { match self { ConstraintType::Eq => "eq", ConstraintType::Ineq => "ineq" } }
+}
+
+#[derive(Clone)]
+pub enum ConstraintSpec {
+    // LinearConstraint: A x between lb and ub
+    Linear {
+        a: Vec<Vec<f64>>, // shape (m, n)
+        lb: Vec<f64>,     // shape (m,)
+        ub: Vec<f64>,     // shape (m,)
+        keep_feasible: Option<bool>,
+    },
+    // NonlinearConstraint with bounds: fun(x) vector -> between lb and ub
+    NonlinearBounds {
+        fun: Arc<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync + 'static>,
+        lb: Vec<f64>,
+        ub: Vec<f64>,
+    },
+    // Dict-style scalar constraint: {'type': 'eq'|'ineq', 'fun': callable}
+    Dict {
+        ctype: ConstraintType,
+        fun: Arc<dyn Fn(&[f64]) -> f64 + Send + Sync + 'static>,
+    },
+}
+
+// Concrete structs for each constraint kind, plus a combined container
+#[derive(Clone)]
+struct LinearConstr {
+    a: Vec<Vec<f64>>, // (m, n)
+    lb: Vec<f64>,     // (m,)
+    ub: Vec<f64>,     // (m,)
+    keep_feasible: Option<bool>,
+}
+
+#[derive(Clone)]
+struct NonlinearConstrBounds {
+    fun: Arc<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync + 'static>,
+    lb: Vec<f64>,
+    ub: Vec<f64>,
+}
+
+#[derive(Clone)]
+struct DictConstr {
+    ctype: ConstraintType,
+    fun: Arc<dyn Fn(&[f64]) -> f64 + Send + Sync + 'static>,
+}
+
+#[derive(Clone, Default)]
+struct CombinedConstraints {
+    linear: Vec<LinearConstr>,
+    nonlinear: Vec<NonlinearConstrBounds>,
+    dict: Vec<DictConstr>,
+}
+
+impl From<Vec<ConstraintSpec>> for CombinedConstraints {
+    fn from(specs: Vec<ConstraintSpec>) -> Self {
+        let mut cc = CombinedConstraints::default();
+        for s in specs {
+            match s {
+                ConstraintSpec::Linear { a, lb, ub, keep_feasible } => cc.linear.push(LinearConstr { a, lb, ub, keep_feasible }),
+                ConstraintSpec::NonlinearBounds { fun, lb, ub } => cc.nonlinear.push(NonlinearConstrBounds { fun, lb, ub }),
+                ConstraintSpec::Dict { ctype, fun } => cc.dict.push(DictConstr { ctype, fun }),
+            }
+        }
+        cc
+    }
+}
+
+impl CombinedConstraints {
+    fn to_py_list<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
+        let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(
+            self.linear.len() + self.nonlinear.len() + self.dict.len(),
+        );
+
+        // Import optimize once
+        let optimize = PyModule::import(py, "scipy.optimize").unwrap();
+
+        // Linear constraints (auto-split rows that are equalities vs inequalities)
+        if !self.linear.is_empty() {
+            let constr_cls = optimize.getattr("LinearConstraint").unwrap();
+            for lc in &self.linear {
+                let tol = 0.0_f64; // exact compare is fine for our constructed values; adjust if needed
+                let mut a_eq: Vec<Vec<f64>> = Vec::new();
+                let mut lb_eq: Vec<f64> = Vec::new();
+                let mut ub_eq: Vec<f64> = Vec::new();
+                let mut a_in: Vec<Vec<f64>> = Vec::new();
+                let mut lb_in: Vec<f64> = Vec::new();
+                let mut ub_in: Vec<f64> = Vec::new();
+
+                for (i, row) in lc.a.iter().enumerate() {
+                    if i < lc.lb.len() && i < lc.ub.len() && (lc.lb[i] - lc.ub[i]).abs() <= tol {
+                        a_eq.push(row.clone());
+                        lb_eq.push(lc.lb[i]);
+                        ub_eq.push(lc.ub[i]);
+                    } else {
+                        a_in.push(row.clone());
+                        lb_in.push(lc.lb.get(i).copied().unwrap_or(f64::NEG_INFINITY));
+                        ub_in.push(lc.ub.get(i).copied().unwrap_or(f64::INFINITY));
+                    }
+                }
+
+                let kwargs_c = PyDict::new(py);
+                if let Some(kf) = lc.keep_feasible { kwargs_c.set_item("keep_feasible", kf).unwrap(); }
+
+                if !a_in.is_empty() {
+                    let a_arr = PyArray2::<f64>::from_vec2(py, &a_in).unwrap();
+                    let lb_arr = PyArray1::<f64>::from_vec(py, lb_in);
+                    let ub_arr = PyArray1::<f64>::from_vec(py, ub_in);
+                    let obj_any = constr_cls.call((a_arr, lb_arr, ub_arr), Some(&kwargs_c)).unwrap();
+                    items.push(obj_any);
+                }
+                if !a_eq.is_empty() {
+                    let a_arr = PyArray2::<f64>::from_vec2(py, &a_eq).unwrap();
+                    let lb_arr = PyArray1::<f64>::from_vec(py, lb_eq.clone());
+                    let ub_arr = PyArray1::<f64>::from_vec(py, ub_eq.clone());
+                    let obj_any = constr_cls.call((a_arr, lb_arr, ub_arr), Some(&kwargs_c)).unwrap();
+                    items.push(obj_any);
+                }
+            }
+        }
+
+        // Nonlinear bounds constraints
+        if !self.nonlinear.is_empty() {
+            let constr_cls = optimize.getattr("NonlinearConstraint").unwrap();
+            for nc in &self.nonlinear {
+                let fun_obj = Py::new(py, ConstraintFunction { func: nc.fun.clone() }).unwrap();
+                let lb_arr = PyArray1::<f64>::from_vec(py, nc.lb.clone());
+                let ub_arr = PyArray1::<f64>::from_vec(py, nc.ub.clone());
+                let obj_any = constr_cls.call((fun_obj, lb_arr, ub_arr), None).unwrap();
+                items.push(obj_any);
+            }
+        }
+
+        // Dict constraints
+        for dc in &self.dict {
+            let dict = PyDict::new(py);
+            dict.set_item("type", dc.ctype.as_str()).unwrap();
+            let fun_obj = Py::new(py, Objective { func: dc.fun.clone() }).unwrap();
+            dict.set_item("fun", fun_obj).unwrap();
+            items.push(dict.into_any());
+        }
+
+        PyList::new(py, items).unwrap()
     }
 }
 
@@ -302,14 +452,19 @@ impl MinimizerKwargs {
 }
 
 struct ShgoOptions {
-    maxfev: Option<i64>,
-    f_min: Option<f64>,
-    f_tol: Option<f64>,
-    maxiter: Option<i64>,
-    maxev: Option<i64>,
-    maxtime: Option<f64>,
-    minhgrd: Option<i64>,
-    minimize_every_iter: Option<bool>,
+    maxfev: Option<i64>, // Optional: maximum function evaluations
+    f_min: Option<f64>, // Optional: minimum function value
+    f_tol: Option<f64>, // Optional: function tolerance
+    maxiter: Option<i64>, // Optional: maximum iterations
+    maxev: Option<i64>, // Optional: maximum evaluations
+    maxtime: Option<f64>, // Optional: maximum time allowed
+    minhgrd: Option<i64>, // Optional: minimum gradient norm
+    symmetry: Option<Vec<usize>>, // Only support explicit list of symmetric variable indices
+    minimize_every_iter: Option<bool>, // Optional: whether to minimize at every iteration
+    local_iter: Option<i64>, // Optional: number of local iterations per global iteration
+    infty_constraints: Option<bool>, // Optional: whether to allow infinite constraints (e.g., unbounded)
+    disp: Option<bool>, // Optional: whether to display convergence messages
+    
     // Add more as needed
 }
 
@@ -324,6 +479,13 @@ impl ShgoOptions {
         if let Some(val) = self.maxtime { dict.set_item("maxtime", val).unwrap(); }
         if let Some(val) = self.minhgrd { dict.set_item("minhgrd", val).unwrap(); }
         if let Some(val) = self.minimize_every_iter { dict.set_item("minimize_every_iter", val).unwrap(); }
+        if let Some(val) = self.local_iter { dict.set_item("local_iter", val).unwrap(); }
+        if let Some(val) = self.infty_constraints { dict.set_item("infty_constraints", val).unwrap(); }
+        if let Some(val) = self.disp { dict.set_item("disp", val).unwrap(); }
+        if let Some(ref sym) = self.symmetry {
+            let sym_list = PyList::new(py, sym.iter().copied()).unwrap();
+            dict.set_item("symmetry", sym_list).unwrap();
+        }
         dict
     }
 }
@@ -338,6 +500,7 @@ fn shgo<F, C>(
     callback: Option<C>,
     minimizer_kwargs: Option<MinimizerKwargs>,
     options: Option<ShgoOptions>,
+    constraints: Option<Vec<ConstraintSpec>>,
     sampling_method: Option<&str>,
     workers: Option<usize>,
 ) -> OptimizeResult
@@ -397,6 +560,13 @@ where
         if let Some(iters) = iters { kwargs.set_item("iters", iters).unwrap(); }
         if let Some(cb) = callback { let cb_obj = Py::new(py, Callback { func: Arc::new(cb) }).unwrap(); kwargs.set_item("callback", cb_obj).unwrap(); }
 
+        // Build constraints if provided (using CombinedConstraints helper)
+        if let Some(constraints) = constraints {
+            let combined: CombinedConstraints = constraints.into();
+            let py_constraints = combined.to_py_list(py);
+            kwargs.set_item("constraints", py_constraints).unwrap();
+        }
+
         let py_workers = workers.unwrap_or(1);
         let result_any: Bound<PyAny> = if py_workers > 1 {
             println!("Using {} workers for parallel SHGO", py_workers);
@@ -433,10 +603,12 @@ impl Callback {
 
 
 fn main() {
-    test_basic_rosen();
-    test_rastrigin_partial();
+    // test_basic_rosen();
+    // test_rastrigin_partial();
     test_rastrigin_extra_parameters();
-    test_rastrigin_fake_long_partial();
+    // test_rastrigin_fake_long_partial();
+    test_cattle_feed_constraints();
+    test_cattle_feed_constraints_structured();
 }
 
 
@@ -449,6 +621,7 @@ fn test_basic_rosen() {
         None::<fn(&[f64])>, 
         None, 
         None, 
+    None,
         None, 
         Some(1));
     println!("SHGO result for rosen: {}", result);
@@ -472,6 +645,7 @@ fn test_rastrigin_partial() {
         None::<fn(&[f64])>, 
         None, 
         None, 
+    None,
         None, 
         Some(1));
     println!("SHGO result for rastrigin: {}", result);
@@ -495,7 +669,11 @@ fn test_rastrigin_extra_parameters() {
         maxev: None,
         maxtime: None,
         minhgrd: None,
-        minimize_every_iter: Some(false), // Disable serial local-min on every iter to expose parallel evals
+        symmetry: None,
+        minimize_every_iter: Some(true), // Disable serial local-min on every iter to expose parallel evals
+        local_iter: None,
+        infty_constraints: None,
+        disp: None,
     };
 
     let mut local_opts = std::collections::HashMap::new();
@@ -523,6 +701,7 @@ fn test_rastrigin_extra_parameters() {
         Some(my_callback), // callback
         Some(minimizer_kwargs),
         Some(options),
+    None,
         Some("sobol"), // sampling_method
         None,       // workers: start with 4 to see threading effect
     );
@@ -546,6 +725,7 @@ fn test_rastrigin_fake_long_partial() {
         None::<fn(&[f64])>, 
         None, 
         None, 
+    None,
         None, 
         Some(15));
     println!("SHGO result for fake long rastrigin: {}", result);
@@ -555,4 +735,121 @@ fn test_rastrigin_fake_long_partial() {
         assert!((x - 0.0).abs() < 1e-5, "Result at index {} is not close to 0: {}", i, x);
     }
     println!("Long-running Rastrigin test passed");
+}
+
+fn test_cattle_feed_constraints() {
+    // SHGO documentation example: cattle-feed linear objective with nonlinear and equality constraints
+    let f = |x: &[f64]| 24.55*x[0] + 26.75*x[1] + 39.0*x[2] + 40.50*x[3];
+
+    let g1 = |x: &[f64]| 2.3*x[0] + 5.6*x[1] + 11.1*x[2] + 1.3*x[3] - 5.0; // >= 0
+    let g2 = |x: &[f64]| {
+        let q = 0.28*x[0]*x[0] + 0.19*x[1]*x[1] + 20.5*x[2]*x[2] + 0.62*x[3]*x[3];
+        (12.0*x[0] + 11.9*x[1] + 41.8*x[2] + 52.1*x[3] - 21.0) - 1.645 * q.sqrt()
+    }; // >= 0
+    let h1 = |x: &[f64]| x[0] + x[1] + x[2] + x[3] - 1.0; // == 0
+
+    let constraints = vec![
+        ConstraintSpec::Dict { ctype: ConstraintType::Ineq, fun: Arc::new(g1) },
+        ConstraintSpec::Dict { ctype: ConstraintType::Ineq, fun: Arc::new(g2) },
+        ConstraintSpec::Dict { ctype: ConstraintType::Eq,   fun: Arc::new(h1) },
+    ];
+
+    let bounds: Vec<(f64,f64)> = std::iter::repeat((0.0, 1.0)).take(4).collect();
+
+    let result = shgo(
+        f,
+        &bounds,
+        Some(150), // n=150 as in docs
+        None,
+        None::<fn(&[f64])>,
+        None,
+        None,
+        Some(constraints),
+        None,
+        Some(1),
+    );
+
+    println!("Cattle-feed SHGO result:\n{}", result);
+
+    // Basic checks: bounds, feasibility, and equality approximately satisfied
+    let x = &result.x;
+    for (i,&xi) in x.iter().enumerate() {
+        assert!(xi >= -1e-10 && xi <= 1.0 + 1e-10, "x[{}] out of bounds: {}", i, xi);
+    }
+    let g1v = g1(x);
+    let g2v = g2(x);
+    let h1v = h1(x);
+    assert!(g1v >= -1e-6, "g1 violated: {}", g1v);
+    assert!(g2v >= -1e-6, "g2 violated: {}", g2v);
+    assert!(h1v.abs() <= 1e-6, "h1 not equal to 0: {}", h1v);
+    if let Some(s) = result.success { assert!(s, "Optimization did not report success"); }
+
+    println!("Cattle-feed constraints test passed");
+}
+
+fn test_cattle_feed_constraints_structured() {
+    // Same cattle-feed problem. Keep the same constraint TYPES as the dict test
+    // (g1: ineq, g2: ineq, h1: eq) but mix representations:
+    // - g1 as LinearConstraint (ineq)
+    // - g2 as NonlinearConstraint (ineq)
+    // - h1 as dict (eq)
+    let f = |x: &[f64]| 24.55*x[0] + 26.75*x[1] + 39.0*x[2] + 40.50*x[3];
+
+    // g1: 2.3x0 + 5.6x1 + 11.1x2 + 1.3x3 >= 5  (linear inequality)
+    let a = vec![
+        vec![2.3, 5.6, 11.1, 1.3],
+    ];
+    let lb = vec![5.0];
+    let ub = vec![f64::INFINITY];
+
+    // g2 as nonlinear inequality: g2(x) >= 0
+    let g2 = |x: &[f64]| {
+        let q = 0.28*x[0]*x[0] + 0.19*x[1]*x[1] + 20.5*x[2]*x[2] + 0.62*x[3]*x[3];
+        (12.0*x[0] + 11.9*x[1] + 41.8*x[2] + 52.1*x[3] - 21.0) - 1.645 * q.sqrt()
+    };
+    let g2_vec = move |x: &[f64]| vec![g2(x)];
+    // h1 as equality via dict to test mixing methods
+    let h1 = |x: &[f64]| x[0] + x[1] + x[2] + x[3] - 1.0; // == 0
+
+    let constraints = vec![
+        ConstraintSpec::Linear { a, lb, ub, keep_feasible: None },
+        ConstraintSpec::NonlinearBounds { fun: Arc::new(g2_vec), lb: vec![0.0], ub: vec![f64::INFINITY] },
+        ConstraintSpec::Dict { ctype: ConstraintType::Eq, fun: Arc::new(h1) },
+    ];
+
+    let bounds: Vec<(f64,f64)> = std::iter::repeat((0.0, 1.0)).take(4).collect();
+
+    let result = shgo(
+        f,
+        &bounds,
+        Some(150),
+        None,
+        None::<fn(&[f64])>,
+        None,
+        None,
+        Some(constraints),
+        None,
+        Some(1),
+    );
+
+    println!("Cattle-feed (structured) SHGO result:\n{}", result);
+
+    // Validate feasibility
+    let x = &result.x;
+    for (i,&xi) in x.iter().enumerate() {
+        assert!(xi >= -1e-10 && xi <= 1.0 + 1e-10, "x[{}] out of bounds: {}", i, xi);
+    }
+    // Check linear constraints
+    let g1v = 2.3*x[0] + 5.6*x[1] + 11.1*x[2] + 1.3*x[3] - 5.0;
+    let h1v = x[0] + x[1] + x[2] + x[3] - 1.0;
+    let g2v = {
+        let q = 0.28*x[0]*x[0] + 0.19*x[1]*x[1] + 20.5*x[2]*x[2] + 0.62*x[3]*x[3];
+        (12.0*x[0] + 11.9*x[1] + 41.8*x[2] + 52.1*x[3] - 21.0) - 1.645 * q.sqrt()
+    };
+    assert!(g1v >= -1e-6, "g1 violated: {}", g1v);
+    assert!(g2v >= -1e-6, "g2 violated: {}", g2v);
+    assert!(h1v.abs() <= 1e-6, "h1 not equal to 0: {}", h1v);
+    if let Some(s) = result.success { assert!(s, "Optimization did not report success"); }
+
+    println!("Cattle-feed structured constraints test passed");
 }
