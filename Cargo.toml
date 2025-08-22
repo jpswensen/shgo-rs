@@ -3,6 +3,13 @@ name = "shgo-rs"
 version = "0.1.0"
 edition = "2021"
 
+license = "MIT"
+description = "A Rust implementation of a wrapper for the SHGO optimization algorithm from scipy.optimize"
+repository = "https://github.com/jpswensen/shgo-rs"
+readme = "README.md"
+keywords = ["optimization","nonlinear","global optimization","scipy","shgo"]
+categories = ["science", "algorithms"]
+
 [dependencies]
 pyo3 = { version = "0.25.1", features = ["auto-initialize"] }
 numpy = "0.25.0"
