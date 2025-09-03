@@ -8,6 +8,7 @@ A Rust wrapper for the Python/SciPy implementation of the shgo global optimizati
 * We created Rust-native companion structs of ```OptimizeResult```, ```MinimizerKwargs```, and ```ShgoOptions``` to mirror their Python counterparts
 * We created Rust-native companion struct to do LinearConstraint, NonlinearConstraint, and dict+function based constraints
 * The one deviation from the Python function signature is that Rust doesn't allow tuples of mixed types. So, an example is given where a partial function closure is used to capture non-optimized parameters so we don't have to include and ```args``` parameter of mixed types.
+* The new version also has a wrapper for C and C++, along with examples of how to compile and use. These wrappers should feel pretty seamless and follow the same pattern as the Python and Rust interfaces. For C++, the wrapper uses std::optional to allow optional parameters.
 * Six examples are provided:
   * Rosen with default parameters (same as the SHGO Python documentation)
   * Rastrigin with a partial function closure to demonstrate how to perform the alternative to the ```args``` parameter in Python
