@@ -1,6 +1,6 @@
 [package]
 name = "shgo-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "A Rust implementation of a wrapper for the SHGO optimization algorithm from scipy.optimize"
@@ -13,8 +13,8 @@ categories = ["science", "algorithms"]
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
-pyo3 = { version = "0.25.1", features = ["auto-initialize"] }
-numpy = "0.25.0"
+pyo3 = { version = "0.26.0", features = ["auto-initialize"] }
+numpy = "0.26.0"
 rand = "0.9.2"
 
 [profile.release]

@@ -28,7 +28,7 @@ where
     std::env::set_var("MKL_NUM_THREADS", "1");
     std::env::set_var("NUMEXPR_NUM_THREADS", "1");
 
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         if let Ok(venv) = env::var("VIRTUAL_ENV") {
             let sys = py.import("sys").unwrap();
             let version_info = sys.getattr("version_info").unwrap();
