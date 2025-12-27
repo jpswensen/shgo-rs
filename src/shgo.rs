@@ -1,4 +1,4 @@
-use std::{env, sync::Arc};
+use std::{env, path::Path, sync::Arc};
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyDict, PyList};
 
@@ -34,11 +34,37 @@ where
             let version_info = sys.getattr("version_info").unwrap();
             let major: i32 = version_info.getattr("major").unwrap().extract().unwrap();
             let minor: i32 = version_info.getattr("minor").unwrap().extract().unwrap();
-            let lib_dir = format!("python{}.{}t", major, minor);
+
+            let abiflags: String = sys
+                .getattr("abiflags")
+                .ok()
+                .and_then(|v| v.extract::<String>().ok())
+                .unwrap_or_default();
+
+            let candidates = [
+                format!("python{}.{}{}", major, minor, abiflags),
+                format!("python{}.{}", major, minor),
+                format!("python{}.{}t", major, minor),
+            ];
+
+            let lib_dir = candidates
+                .iter()
+                .find(|d| Path::new(&format!("{}/lib/{}/site-packages", venv, d)).exists())
+                .cloned()
+                .unwrap_or_else(|| format!("python{}.{}{}", major, minor, abiflags));
+
             let site_packages = format!("{}/lib/{}/site-packages", venv, lib_dir);
             let sys_path = sys.getattr("path").unwrap();
             sys_path.call_method1("insert", (0, site_packages)).unwrap();
+
+            println!("Python environment info:\nVIRTUAL_ENV: {}\nPython executable: {}\nPython sys.path: {:?}", 
+                venv, 
+                sys.getattr("executable").unwrap().extract::<String>().unwrap(), 
+                sys_path.extract::<Vec<String>>().unwrap()
+            );
         }
+
+        
 
         let mp = PyModule::import(py, "multiprocessing").unwrap();
         let _ = mp.call_method1("set_start_method", ("spawn", true));
