@@ -60,7 +60,7 @@ impl fmt::Display for OptimizeResult {
 
 fn try_get_attr<'py, T>(obj: &Bound<'py, PyAny>, name: &str) -> Option<T>
 where
-    T: pyo3::FromPyObject<'py>,
+    for<'a> T: pyo3::FromPyObject<'a, 'py>,
 {
     match obj.getattr(name) {
         Ok(val) => val.extract::<T>().ok(),

@@ -57,11 +57,14 @@ where
             let sys_path = sys.getattr("path").unwrap();
             sys_path.call_method1("insert", (0, site_packages)).unwrap();
 
-            println!("Python environment info:\nVIRTUAL_ENV: {}\nPython executable: {}\nPython sys.path: {:?}", 
-                venv, 
-                sys.getattr("executable").unwrap().extract::<String>().unwrap(), 
-                sys_path.extract::<Vec<String>>().unwrap()
-            );
+            // Only print this info if an environment variable named DEBUG_SHGO_RS is set
+            if env::var("DEBUG_SHGO_RS").is_ok() {
+                println!("Python environment info:\nVIRTUAL_ENV: {}\nPython executable: {}\nPython sys.path: {:?}", 
+                    venv, 
+                    sys.getattr("executable").unwrap().extract::<String>().unwrap(), 
+                    sys_path.extract::<Vec<String>>().unwrap()
+                );
+            }
         }
 
         
